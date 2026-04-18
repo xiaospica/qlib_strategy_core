@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qlib_strategy_core"
+version = "0.1.0"
+description = "Shared factor handlers + inference runtime for qlib_strategy_dev and vnpy_strategy_dev"
+requires-python = ">=3.10"
+authors = [{ name = "xiaospica" }]
+readme = "README.md"
+dependencies = [
+    "numpy",
+    "pandas",
+    "pyarrow",
+    "pyqlib",
+    "pydantic>=2",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "build"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["qlib_strategy_core*"]
