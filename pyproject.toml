@@ -4,16 +4,19 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "qlib_strategy_core"
-version = "0.1.0"
+version = "0.2.0"
 description = "Shared factor handlers + inference runtime for qlib_strategy_dev and vnpy_strategy_dev"
 requires-python = ">=3.10"
 authors = [{ name = "xiaospica" }]
 readme = "README.md"
+# NOTE: qlib is consumed as an external dependency — on vnpy nodes with custom
+# mirrors it may be available under the name `qlib` rather than `pyqlib`.
+# Not declared here so that `pip install -e` / submodule-sys.path consumers can
+# satisfy it via their own channel.
 dependencies = [
     "numpy",
     "pandas",
     "pyarrow",
-    "pyqlib",
     "pydantic>=2",
 ]
 

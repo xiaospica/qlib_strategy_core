@@ -4,7 +4,10 @@
 def test_root_version():
     import qlib_strategy_core
 
-    assert qlib_strategy_core.__version__ == "0.1.0"
+    # Bump-resilient: version is valid SemVer x.y.z
+    parts = qlib_strategy_core.__version__.split(".")
+    assert len(parts) == 3
+    assert all(p.isdigit() for p in parts)
 
 
 def test_handlers_import():
@@ -23,10 +26,22 @@ def test_pipeline_import():
 
 
 def test_inference_import():
-    from qlib_strategy_core.inference import predict_from_recorder, LIVE_HANDLER_DEFAULTS
+    from qlib_strategy_core.inference import (
+        predict_from_recorder,
+        predict_from_bundle,
+        LIVE_HANDLER_DEFAULTS,
+    )
 
     assert callable(predict_from_recorder)
+    assert callable(predict_from_bundle)
     assert LIVE_HANDLER_DEFAULTS["use_cache"] is False
+
+
+def test_root_version_bumped_to_0_2():
+    """v0.2.0 adds predict_from_bundle for mlflow-free inference."""
+    import qlib_strategy_core
+
+    assert qlib_strategy_core.__version__ >= "0.2"
 
 
 def test_config_defaults():
