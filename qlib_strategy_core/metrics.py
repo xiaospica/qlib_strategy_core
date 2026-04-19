@@ -54,22 +54,43 @@ def _cross_section_corr(
     return float(df["p"].corr(df["y"], method=method))
 
 
+def _latest_common_date(pred_df: pd.DataFrame, label_series: pd.Series):
+    """Most recent date present in both pred_df and label_series.
+
+    label_series often truncates N days earlier than pred_df because labels
+    like ``Ref($close, -11) / Ref($close, -1) - 1`` can't evaluate for the
+    last N trading days (forward window exceeds available data). Using
+    ``pred_df.datetime.max()`` directly would KeyError on label. Instead
+    fall back to the latest date where both sides have rows.
+    """
+    pred_dates = set(pred_df.index.get_level_values("datetime").unique())
+    label_dates = set(label_series.index.get_level_values("datetime").unique())
+    common = pred_dates & label_dates
+    if not common:
+        return None
+    return max(common)
+
+
 def compute_ic(pred_df: pd.DataFrame, label_series: pd.Series) -> float:
-    """Latest-day Pearson IC.
+    """Latest-common-day Pearson IC.
+
+    Uses the most recent date present in BOTH pred_df and label_series. If
+    label_series is missing the last N days (due to forward-return horizon),
+    the IC is computed on the latest day that has both prediction and label.
 
     Parameters
     ----------
     pred_df : DataFrame
-        MultiIndex (datetime, instrument), column ``score``. Uses only the
-        max datetime in the index.
+        MultiIndex (datetime, instrument), column ``score``.
     label_series : Series
         MultiIndex (datetime, instrument), realized returns (T+1 or whatever
         horizon the model targets).
     """
     if pred_df.empty or label_series.empty:
         return float("nan")
-
-    t = pred_df.index.get_level_values("datetime").max()
+    t = _latest_common_date(pred_df, label_series)
+    if t is None:
+        return float("nan")
     try:
         p = pred_df.xs(t, level="datetime")["score"]
         y = label_series.xs(t, level="datetime")
@@ -79,11 +100,12 @@ def compute_ic(pred_df: pd.DataFrame, label_series: pd.Series) -> float:
 
 
 def compute_rank_ic(pred_df: pd.DataFrame, label_series: pd.Series) -> float:
-    """Latest-day Spearman rank IC. Same shape as :func:`compute_ic`."""
+    """Latest-common-day Spearman rank IC. Same shape as :func:`compute_ic`."""
     if pred_df.empty or label_series.empty:
         return float("nan")
-
-    t = pred_df.index.get_level_values("datetime").max()
+    t = _latest_common_date(pred_df, label_series)
+    if t is None:
+        return float("nan")
     try:
         p = pred_df.xs(t, level="datetime")["score"]
         y = label_series.xs(t, level="datetime")
@@ -283,4 +305,185 @@ def compute_feature_missing_rate(features_df: pd.DataFrame) -> Dict[str, float]:
     return {
         str(col): float(features_df[col].isna().sum() / n)
         for col in features_df.columns
+    }
+
+
+# ---------------------------------------------------------------------------
+# Cross-day / time-series aggregation (called by monitoring server,
+# not by subprocess inference). Single source of truth for IC / PSI trend
+# analysis — downstream (mlearnweb ml_aggregation_service) imports these.
+# ---------------------------------------------------------------------------
+
+
+def compute_icir(
+    metrics_series: List[Dict[str, object]],
+    window: int,
+) -> Dict[str, Optional[float]]:
+    """Rolling ICIR = mean(ic) / std(ic) over the last ``window`` snapshots.
+
+    metrics_series: list of snapshots each with at least an "ic" key (None
+    allowed). Ordering: oldest first → most recent last (same as
+    ``ml_metric_snapshots`` ORDER BY trade_date ASC).
+
+    Returns ``{window, icir, ic_mean, ic_std, n_samples}``.
+    """
+    recent = metrics_series[-window:] if len(metrics_series) > window else metrics_series
+    ics = [m.get("ic") for m in recent]
+    valid = [v for v in ics if v is not None]
+    if len(valid) < 2:
+        mean = valid[0] if valid else None
+        return {"window": window, "icir": None, "ic_mean": mean, "ic_std": None, "n_samples": len(valid)}
+    mean = sum(valid) / len(valid)
+    var = sum((v - mean) ** 2 for v in valid) / (len(valid) - 1)
+    std = var ** 0.5
+    icir = (mean / std) if std > 0 else None
+    return {"window": window, "icir": icir, "ic_mean": mean, "ic_std": std, "n_samples": len(valid)}
+
+
+def psi_trend_alerts(
+    metrics_series: List[Dict[str, object]],
+    threshold: float = 0.25,
+    consecutive_days: int = 3,
+) -> Dict[str, object]:
+    """连续 N 日 psi_mean > threshold 触发告警.
+
+    Returns ``{triggered, threshold, consecutive_days, last_streak_days,
+               max_streak_days, first_alert_date}``.
+    """
+    streak = 0
+    max_streak = 0
+    first_alert_date: Optional[str] = None
+    for m in metrics_series:
+        psi = m.get("psi_mean")
+        if psi is not None and psi > threshold:
+            streak += 1
+            if streak >= consecutive_days and first_alert_date is None:
+                first_alert_date = str(m.get("trade_date", ""))[:10]
+            max_streak = max(max_streak, streak)
+        else:
+            streak = 0
+    return {
+        "triggered": max_streak >= consecutive_days,
+        "threshold": threshold,
+        "consecutive_days": consecutive_days,
+        "last_streak_days": streak,
+        "max_streak_days": max_streak,
+        "first_alert_date": first_alert_date,
+    }
+
+
+def detect_ic_decay(
+    metrics_series: List[Dict[str, object]],
+    min_samples: int = 10,
+    decay_ratio_threshold: float = 0.5,
+    absolute_floor: float = 0.02,
+) -> Dict[str, object]:
+    """Detect material degradation in daily IC vs an earlier window.
+
+    Heuristic (no t-test, small-sample friendly):
+      1. Split samples by mid → prior half / recent half
+      2. Trigger A (衰减): prior_mean > 0 AND recent_mean < prior_mean * decay_ratio_threshold
+      3. Trigger B (崩盘): prior_mean >= absolute_floor AND recent_mean < absolute_floor
+
+    Returns ``{triggered, reason, recent_ic_mean, prior_ic_mean, decay_ratio, n_recent, n_prior}``.
+    """
+    vals = [m.get("ic") for m in metrics_series]
+    valid = [v for v in vals if v is not None]
+    if len(valid) < min_samples:
+        return {
+            "triggered": False,
+            "reason": f"样本不足 ({len(valid)}/{min_samples})",
+            "recent_ic_mean": None, "prior_ic_mean": None, "decay_ratio": None,
+            "n_recent": 0, "n_prior": 0,
+        }
+    mid = len(valid) // 2
+    prior = valid[:mid]
+    recent = valid[mid:]
+    prior_mean = sum(prior) / len(prior)
+    recent_mean = sum(recent) / len(recent)
+    decay_ratio = (recent_mean / prior_mean) if prior_mean not in (0, None) else None
+
+    if prior_mean >= absolute_floor and recent_mean < absolute_floor:
+        return {
+            "triggered": True,
+            "reason": f"IC 均值跌破 {absolute_floor} (近期 {recent_mean:.4f} vs 前期 {prior_mean:.4f})",
+            "recent_ic_mean": recent_mean, "prior_ic_mean": prior_mean,
+            "decay_ratio": decay_ratio,
+            "n_recent": len(recent), "n_prior": len(prior),
+        }
+    if prior_mean > 0 and recent_mean < prior_mean * decay_ratio_threshold:
+        return {
+            "triggered": True,
+            "reason": f"IC 较前期下滑 {(1 - decay_ratio) * 100:.1f}% (近期 {recent_mean:.4f} vs 前期 {prior_mean:.4f})",
+            "recent_ic_mean": recent_mean, "prior_ic_mean": prior_mean,
+            "decay_ratio": decay_ratio,
+            "n_recent": len(recent), "n_prior": len(prior),
+        }
+    return {
+        "triggered": False,
+        "reason": "OK",
+        "recent_ic_mean": recent_mean, "prior_ic_mean": prior_mean,
+        "decay_ratio": decay_ratio,
+        "n_recent": len(recent), "n_prior": len(prior),
+    }
+
+
+def compute_live_vs_backtest_diff(
+    live_pred: pd.DataFrame,
+    backtest_pred: pd.DataFrame,
+) -> Dict[str, object]:
+    """Compare live prediction DataFrame with training-time backtest prediction.
+
+    Both must be MultiIndex (datetime, instrument) with a ``score`` column.
+
+    Returns per-date correlation + aggregate coverage + cumulative gap metrics:
+      {
+        "per_date": [{"trade_date", "corr", "mean_abs_diff", "coverage", "n_overlap"}],
+        "coverage_ratio": <live-dates with backtest data / live-dates total>,
+        "corr_mean": <pearson of per-date corr>,
+        "n_dates_in_overlap": int,
+      }
+    """
+    if live_pred.empty or backtest_pred.empty:
+        return {
+            "per_date": [], "coverage_ratio": 0.0,
+            "corr_mean": None, "n_dates_in_overlap": 0,
+        }
+
+    live_dates = sorted(set(live_pred.index.get_level_values("datetime").unique()))
+    bt_dates = set(backtest_pred.index.get_level_values("datetime").unique())
+    overlap_dates = [d for d in live_dates if d in bt_dates]
+
+    per_date: List[Dict[str, object]] = []
+    for t in overlap_dates:
+        try:
+            lp = live_pred.xs(t, level="datetime")["score"]
+            bp = backtest_pred.xs(t, level="datetime")["score"]
+        except KeyError:
+            continue
+        joined = pd.concat({"l": lp, "b": bp}, axis=1).dropna()
+        if len(joined) < 5:
+            continue
+        try:
+            corr = float(joined["l"].corr(joined["b"], method="pearson"))
+        except Exception:
+            corr = None
+        mean_abs_diff = float((joined["l"] - joined["b"]).abs().mean())
+        per_date.append({
+            "trade_date": str(pd.Timestamp(t).date()),
+            "corr": corr,
+            "mean_abs_diff": mean_abs_diff,
+            "coverage": float(len(joined) / max(len(lp), 1)),
+            "n_overlap": int(len(joined)),
+        })
+
+    corrs = [p["corr"] for p in per_date if p["corr"] is not None]
+    corr_mean = (sum(corrs) / len(corrs)) if corrs else None
+    coverage_ratio = (len(overlap_dates) / max(len(live_dates), 1)) if live_dates else 0.0
+
+    return {
+        "per_date": per_date,
+        "coverage_ratio": coverage_ratio,
+        "corr_mean": corr_mean,
+        "n_dates_in_overlap": len(per_date),
     }

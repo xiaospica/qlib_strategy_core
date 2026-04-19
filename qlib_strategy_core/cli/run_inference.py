@@ -178,14 +178,47 @@ def main() -> int:
         metrics.update(compute_prediction_stats(pred_df))
         metrics["score_histogram"] = compute_score_histogram(pred_df, n_bins=20)
 
-        # PSI + KS + missing rate need the feature matrix — try to get it from the dataset
+        # Build test-segment dataset once — used for IC (labels) + PSI/KS (features)
+        dataset = None
+        try:
+            from qlib_strategy_core.pipeline import TaskBuilder
+            dataset = TaskBuilder.build_dataset_from_task(task)
+        except Exception as exc:
+            metrics["dataset_error"] = f"{type(exc).__name__}: {exc}"
+
+        # IC / RankIC — latest-day cross-section vs. realized forward returns.
+        # NaN (e.g. when the most recent day's forward window exceeds available
+        # bin data) is emitted as JSON null; downstream `metrics.get("ic")` → None.
+        import math
+        metrics["ic"] = None
+        metrics["rank_ic"] = None
+        if dataset is not None:
+            try:
+                label_prep = dataset.prepare(["test"], col_set="label")[0]
+                label_series = (
+                    label_prep.iloc[:, 0]
+                    if isinstance(label_prep, pd.DataFrame) and label_prep.shape[1] >= 1
+                    else label_prep
+                )
+                if hasattr(label_series, "dropna"):
+                    label_series = label_series.dropna()
+                if len(label_series) > 0:
+                    ic = compute_ic(pred_df, label_series)
+                    rank_ic = compute_rank_ic(pred_df, label_series)
+                    metrics["ic"] = None if (isinstance(ic, float) and math.isnan(ic)) else ic
+                    metrics["rank_ic"] = None if (isinstance(rank_ic, float) and math.isnan(rank_ic)) else rank_ic
+            except Exception as exc:
+                metrics["ic_error"] = f"{type(exc).__name__}: {exc}"
+
+        # PSI + KS + missing rate need the feature matrix from the same dataset
         baseline_path = Path(args.baseline) if args.baseline else (bundle_dir / "baseline.parquet")
-        if baseline_path.exists():
+        if not baseline_path.exists():
+            metrics["baseline_error"] = f"baseline parquet not found: {baseline_path}"
+        elif dataset is None:
+            metrics["baseline_error"] = "dataset build failed; see dataset_error"
+        else:
             try:
                 baseline_df = pd.read_parquet(baseline_path)
-                # Feature matrix: rebuild dataset test segment
-                from qlib_strategy_core.pipeline import TaskBuilder
-                dataset = TaskBuilder.build_dataset_from_task(task)
                 features_df = dataset.prepare(["test"], col_set="feature")[0]
                 if isinstance(features_df.columns, pd.MultiIndex):
                     features_df.columns = [c[-1] if isinstance(c, tuple) else c for c in features_df.columns]
@@ -197,8 +230,6 @@ def main() -> int:
                 metrics["feat_missing"] = compute_feature_missing_rate(features_df)
             except Exception as exc:
                 metrics["baseline_error"] = f"{type(exc).__name__}: {exc}"
-        else:
-            metrics["baseline_error"] = f"baseline parquet not found: {baseline_path}"
 
         _atomic_write_json(out_dir / "metrics.json", metrics)
 
