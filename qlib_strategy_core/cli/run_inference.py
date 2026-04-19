@@ -43,6 +43,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict
 
+# Ensure the vendored qlib at ../../qlib is preferred over any pip-installed one.
+# Layout: vendor/qlib_strategy_core/qlib_strategy_core/cli/run_inference.py
+#                ^^^^^^^^^^^^^^^^^^^ this dir is what we need on sys.path
+_CORE_ROOT = Path(__file__).resolve().parents[2]
+if _CORE_ROOT.exists() and str(_CORE_ROOT) not in sys.path:
+    sys.path.insert(0, str(_CORE_ROOT))
+
 import pandas as pd
 
 
