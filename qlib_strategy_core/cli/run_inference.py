@@ -89,6 +89,16 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Install MetaPathFinder for pre-0.2 MLflow artifact module paths (factor_factory.*)",
     )
+    p.add_argument(
+        "--filter-parquet",
+        default=None,
+        help=(
+            "Override handler's filter_parquet_path at runtime. "
+            "Live inference should pass snapshots/filtered/csi300_filtered_{live_end}.parquet "
+            "so the universe filter reflects the exact frozen snapshot for that date. "
+            "If omitted, handler kwargs from task.json are used as-is."
+        ),
+    )
     return p
 
 
@@ -156,11 +166,19 @@ def main() -> int:
 
         live_end_ts = pd.Timestamp(args.live_end).normalize()
 
+        # Phase 4 v2: 按 live_end 覆盖 handler 的 filter_parquet. 注意 handler
+        # 的参数名是 ``filter_parquet`` (见 Alpha158CustomDataLoader.__init__),
+        # 不是 filter_parquet_path.
+        handler_overrides: Dict[str, Any] = {}
+        if args.filter_parquet:
+            handler_overrides["filter_parquet"] = args.filter_parquet
+
         # 1. predict
         pred_df, task = predict_from_bundle(
             bundle_dir=bundle_dir,
             live_end=live_end_ts,
             lookback_days=args.lookback,
+            handler_overrides=handler_overrides or None,
         )
 
         _atomic_write_parquet(out_dir / "predictions.parquet", pred_df)
