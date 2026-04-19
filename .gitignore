@@ -10,3 +10,9 @@ dist/
 .env
 .vscode/
 .idea/
+# Cython build artifacts — keep .pyd/.pyx, drop transpiled + link artifacts
+qlib/data/_libs/*.cpp
+qlib/data/_libs/*.c
+qlib/data/_libs/*.obj
+qlib/data/_libs/*.lib
+qlib/data/_libs/*.exp

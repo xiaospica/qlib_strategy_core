@@ -6,6 +6,10 @@
 These are the two choke points for train/inference symmetry: if the inference
 side rebuilds a DatasetH from the same task artifact and syncs handler times
 the same way, the feature matrix is byte-identical to training.
+
+MLflow-dependent imports (``qlib.workflow``, ``qlib.workflow.task.gen``) are
+deferred so that inference-only environments (e.g., vnpy nodes without
+``mlflow`` installed) can still import this module for the predict path.
 """
 
 from __future__ import annotations
@@ -20,8 +24,11 @@ import pandas as pd
 import qlib
 from qlib.constant import REG_CN
 from qlib.utils import init_instance_by_config
-from qlib.workflow import R
-from qlib.workflow.task.gen import RollingGen, task_generator
+
+
+# ROLL_SD constant duplicated here to avoid a qlib.workflow.task.gen import at
+# module load; RollingGen itself is lazily imported inside generate_rolling_tasks.
+_DEFAULT_ROLLING_TYPE = "-"  # == RollingGen.ROLL_SD when imported lazily
 
 
 class RollingEnv:
@@ -57,13 +64,15 @@ class RollingEnv:
             os.makedirs(mlflow_path, exist_ok=True)
 
         if mlflow_tracking_uri:
-            import mlflow
+            import mlflow  # lazy: training side only
 
             mlflow.set_tracking_uri(mlflow_tracking_uri)
 
         qlib.init(provider_uri=provider_uri, region=region)
 
         if mlflow_tracking_uri:
+            from qlib.workflow import R  # lazy: avoid mlflow dep on inference boxes
+
             R.set_uri(mlflow_tracking_uri)
 
         RollingEnv._qlib_ready = True
@@ -107,11 +116,19 @@ class TaskBuilder:
     def generate_rolling_tasks(
         base_task_config: Any,
         rolling_step: int = 500,
-        rolling_type: str = RollingGen.ROLL_SD,
+        rolling_type: Optional[str] = None,
         custom_segments: Optional[List[Dict[str, Tuple]]] = None,
         verbose: bool = True,
     ) -> List[Dict[str, Any]]:
-        """基于 base task + RollingGen 或自定义 segments 生成若干滚动 task, 并同步 handler 时间."""
+        """基于 base task + RollingGen 或自定义 segments 生成若干滚动 task, 并同步 handler 时间.
+
+        Training-side only (depends on qlib.workflow.task.gen).
+        """
+        from qlib.workflow.task.gen import RollingGen, task_generator  # lazy
+
+        if rolling_type is None:
+            rolling_type = RollingGen.ROLL_SD
+
         print("========== task_generating ==========")
         if custom_segments:
             base = base_task_config if isinstance(base_task_config, dict) else base_task_config[0]

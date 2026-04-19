@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "qlib_strategy_core"
-version = "0.2.0"
+version = "0.3.0"
 description = "Shared factor handlers + inference runtime for qlib_strategy_dev and vnpy_strategy_dev"
 requires-python = ">=3.10"
 authors = [{ name = "xiaospica" }]
