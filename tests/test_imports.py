@@ -44,6 +44,34 @@ def test_root_version_bumped_to_0_2():
     assert qlib_strategy_core.__version__ >= "0.2"
 
 
+def test_metrics_module():
+    from qlib_strategy_core.metrics import (
+        compute_ic,
+        compute_rank_ic,
+        compute_psi_by_feature,
+        compute_ks_by_feature,
+        compute_prediction_stats,
+        compute_score_histogram,
+        compute_feature_missing_rate,
+        summarize_psi,
+    )
+
+    assert all(callable(f) for f in [
+        compute_ic, compute_rank_ic, compute_psi_by_feature,
+        compute_ks_by_feature, compute_prediction_stats,
+        compute_score_histogram, compute_feature_missing_rate,
+        summarize_psi,
+    ])
+
+
+def test_cli_run_inference_module_loadable():
+    """Verify the subprocess entry module imports without running main."""
+    import importlib
+    mod = importlib.import_module("qlib_strategy_core.cli.run_inference")
+    assert hasattr(mod, "main")
+    assert mod.DIAGNOSTICS_SCHEMA_VERSION == 1
+
+
 def test_config_defaults():
     from qlib_strategy_core.config import QSConfig
 
