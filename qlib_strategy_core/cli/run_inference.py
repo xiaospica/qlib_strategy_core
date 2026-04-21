@@ -181,7 +181,18 @@ def main() -> int:
             handler_overrides=handler_overrides or None,
         )
 
-        _atomic_write_parquet(out_dir / "predictions.parquet", pred_df)
+        # pred_df 从 DatasetH test segment = [live_end - lookback, live_end] 来,
+        # 在 qlib bin 每日重建(末尾=live_end)的场景下, 每跨一天就多一天 pred
+        # (见 smoke 实测: 20260407 一天 → 20260417 九天, n_pred 300→2700 累加).
+        # 落盘的 predictions.parquet 和 n_predictions 必须只反映 live_end 当日
+        # 预测(CSI300 ≈ 300 行), 否则下游 selections/topk/metrics 会被历史行
+        # 污染. IC 计算仍用完整 pred_df (历史部分的 label 可能可算, 保留机会).
+        live_end_day = pd.Timestamp(args.live_end).normalize()
+        pred_df_today = pred_df[
+            pred_df.index.get_level_values("datetime").normalize() == live_end_day
+        ]
+
+        _atomic_write_parquet(out_dir / "predictions.parquet", pred_df_today)
 
         # 2. metrics
         metrics: Dict[str, Any] = {
@@ -190,11 +201,11 @@ def main() -> int:
             "trade_date": args.live_end,
             "model_run_id": model_run_id,
             "core_version": core_version,
-            "n_predictions": int(len(pred_df)),
+            "n_predictions": int(len(pred_df_today)),
         }
 
-        metrics.update(compute_prediction_stats(pred_df))
-        metrics["score_histogram"] = compute_score_histogram(pred_df, n_bins=20)
+        metrics.update(compute_prediction_stats(pred_df_today))
+        metrics["score_histogram"] = compute_score_histogram(pred_df_today, n_bins=20)
 
         # Build test-segment dataset once — used for IC (labels) + PSI/KS (features)
         dataset = None
@@ -252,18 +263,20 @@ def main() -> int:
         _atomic_write_json(out_dir / "metrics.json", metrics)
 
         # 3. diagnostics (SENTINEL — last write)
+        # rows/status 用当日 pred (与 predictions.parquet/n_predictions 口径一致);
+        # pred_df (整段 test segment) 只留做 IC/PSI/KS 计算输入.
         diag_base.update({
-            "status": "ok" if len(pred_df) > 0 else "empty",
+            "status": "ok" if len(pred_df_today) > 0 else "empty",
             "exit_code": 0,
             "duration_ms": int((time.time() - t0) * 1000),
-            "rows": int(len(pred_df)),
+            "rows": int(len(pred_df_today)),
             "model_run_id": model_run_id,
             "core_version": core_version,
             "completed_at": datetime.now().isoformat(timespec="seconds"),
         })
         _atomic_write_json(diag_path, diag_base)
 
-        print(f"[run_inference] {args.strategy}@{args.live_end} → {len(pred_df)} rows in {diag_base['duration_ms']}ms")
+        print(f"[run_inference] {args.strategy}@{args.live_end} → {len(pred_df_today)} rows (of {len(pred_df)} total pred_df) in {diag_base['duration_ms']}ms")
         return 0
 
     except Exception as exc:
