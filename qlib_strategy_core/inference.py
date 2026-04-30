@@ -70,6 +70,7 @@ def _predict_core(
     if changed:
         print(f"[qlib_strategy_core] handler 覆盖: {changed}")
 
+    print(f'build_dataset_from_task: {task}')
     dataset = TaskBuilder.build_dataset_from_task(task)
     pred = model.predict(dataset, segment="test")
     if isinstance(pred, pd.Series):
@@ -158,6 +159,75 @@ def _task_from_json_file(path: Union[str, Path]) -> Dict[str, Any]:
                     pd.Timestamp(v[1]) if v[1] is not None else None,
                 )
     return task
+
+
+def _predict_core_range(
+    model: Any,
+    task: Dict[str, Any],
+    segment_start: pd.Timestamp,
+    segment_end: pd.Timestamp,
+    handler_overrides: Optional[Dict[str, Any]] = None,
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """批量预测核心：覆盖整个 [segment_start, segment_end] 区间一次性 predict。
+
+    与 :func:`_predict_core` 区别在于：
+    - 不依赖 lookback_days；调用方直接给 segment 起止日
+    - 适用于 Phase 4 加速回放：一次 dataset build + 一次 predict 出多日结果，
+      避免逐日 spawn 子进程的 ~80% 启动 + qlib 加载开销
+    """
+    task = copy.deepcopy(task)
+    task["dataset"]["kwargs"]["segments"] = {
+        "test": (segment_start, segment_end),
+    }
+    TaskBuilder.sync_handler_time_range(task)
+
+    merged_overrides = dict(LIVE_HANDLER_DEFAULTS)
+    if handler_overrides:
+        merged_overrides.update(handler_overrides)
+    handler_kwargs = task["dataset"]["kwargs"]["handler"]["kwargs"]
+    changed = {k: v for k, v in merged_overrides.items() if handler_kwargs.get(k) != v}
+    handler_kwargs.update(merged_overrides)
+    if changed:
+        print(f"[qlib_strategy_core] handler 覆盖: {changed}")
+
+    dataset = TaskBuilder.build_dataset_from_task(task)
+    pred = model.predict(dataset, segment="test")
+    if isinstance(pred, pd.Series):
+        pred = pred.to_frame("score")
+    return pred, task
+
+
+def predict_range_from_bundle(
+    bundle_dir: Union[str, Path],
+    segment_start: pd.Timestamp,
+    segment_end: pd.Timestamp,
+    handler_overrides: Optional[Dict[str, Any]] = None,
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """批量推理入口：一次加载 bundle + 一次 predict 整个 [segment_start, segment_end] 区间。
+
+    Phase 4 加速回放用。预期加速 ~10-20x：把"逐日 spawn 子进程"的
+    ~80% 启动 + qlib 数据加载开销均摊到一次调用。
+    """
+    bundle_dir = Path(bundle_dir)
+    params_path = bundle_dir / "params.pkl"
+    task_path = bundle_dir / "task.json"
+
+    if not params_path.exists():
+        raise FileNotFoundError(f"bundle missing params.pkl: {params_path}")
+    if not task_path.exists():
+        raise FileNotFoundError(f"bundle missing task.json: {task_path}")
+
+    with open(params_path, "rb") as f:
+        model = pickle.load(f)
+    task = _task_from_json_file(task_path)
+
+    return _predict_core_range(
+        model=model,
+        task=task,
+        segment_start=segment_start,
+        segment_end=segment_end,
+        handler_overrides=handler_overrides,
+    )
 
 
 def predict_from_bundle(

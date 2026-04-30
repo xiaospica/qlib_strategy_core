@@ -74,7 +74,22 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         description="qlib_strategy_core subprocess inference entry — daily pipeline",
     )
     p.add_argument("--bundle-dir", required=True, help="Directory with params.pkl + task.json")
-    p.add_argument("--live-end", required=True, help="Inference end date YYYY-MM-DD")
+    p.add_argument(
+        "--live-end",
+        required=False,
+        default=None,
+        help="单日推理：Inference end date YYYY-MM-DD。与 --live-end-range 互斥",
+    )
+    p.add_argument(
+        "--live-end-range",
+        required=False,
+        default=None,
+        help=(
+            "批量推理（Phase 4 加速回放）：start,end 形式如 2026-01-01,2026-04-29。"
+            "一次性 init qlib + load bundle + build dataset + predict，按日切片输出。"
+            "out-dir 解释为父目录，子进程内部按 yyyymmdd 建子目录。互斥 --live-end。"
+        ),
+    )
     p.add_argument("--lookback", type=int, default=60, help="Natural days lookback")
     p.add_argument("--out-dir", required=True, help="Output directory for three-file bundle")
     p.add_argument("--strategy", default="default", help="Strategy name (metadata)")
@@ -113,9 +128,142 @@ def _load_manifest(bundle_dir: Path) -> Dict[str, Any]:
         return {}
 
 
+def _run_batch_mode(args, t0: float) -> int:
+    """Phase 4 批量推理模式：一次性 init qlib + load bundle + predict 整个区间，按日切片输出。"""
+    from qlib_strategy_core import __version__ as core_version
+    from qlib_strategy_core.inference import predict_range_from_bundle
+    from qlib_strategy_core.pipeline import RollingEnv
+
+    if args.install_legacy_path:
+        from qlib_strategy_core._compat import install_finder
+        install_finder()
+
+    bundle_dir = Path(args.bundle_dir)
+    if not bundle_dir.exists():
+        raise FileNotFoundError(f"bundle dir not found: {bundle_dir}")
+
+    manifest = _load_manifest(bundle_dir)
+    model_run_id = manifest.get("run_id") or bundle_dir.name
+
+    provider_uri = args.provider_uri or os.getenv("QLIB_PROVIDER_URI") or os.getenv("QS_PROVIDER_URI")
+    if not provider_uri:
+        raise RuntimeError("provider_uri required (--provider-uri or QLIB_PROVIDER_URI env)")
+
+    parts = args.live_end_range.split(",")
+    if len(parts) != 2:
+        raise ValueError(f"--live-end-range 必须是 start,end 形式: {args.live_end_range!r}")
+    range_start = pd.Timestamp(parts[0].strip()).normalize()
+    range_end = pd.Timestamp(parts[1].strip()).normalize()
+    if range_start > range_end:
+        raise ValueError(f"start {range_start} > end {range_end}")
+
+    # qlib + handler 一次性加载（这是 ~80% 的回放开销，批量模式核心收益）
+    RollingEnv.setup_env()
+    RollingEnv.init_qlib(provider_uri=provider_uri)
+
+    handler_overrides: Dict[str, Any] = {}
+    if args.filter_parquet:
+        handler_overrides["filter_parquet"] = args.filter_parquet
+
+    # segment 覆盖整个回放窗口 + lookback 前缀（让首日也有完整因子计算窗口）
+    segment_start = range_start - pd.Timedelta(days=args.lookback)
+    print(
+        f"[run_inference batch] strategy={args.strategy} range=[{range_start.date()}, "
+        f"{range_end.date()}] lookback={args.lookback} segment=[{segment_start.date()}, "
+        f"{range_end.date()}]"
+    )
+
+    # 一次 predict 出整段
+    pred_df_full, _task = predict_range_from_bundle(
+        bundle_dir=bundle_dir,
+        segment_start=segment_start,
+        segment_end=range_end,
+        handler_overrides=handler_overrides or None,
+    )
+
+    # datetime level 兼容（与单日模式相同处理）
+    dt_idx = pd.to_datetime(pred_df_full.index.get_level_values("datetime"))
+
+    # 按日切片写每日子目录
+    out_root = Path(args.out_dir)
+    out_root.mkdir(parents=True, exist_ok=True)
+    n_days_with_data = 0
+    n_days_total = 0
+
+    # 遍历整段交易日
+    cursor = range_start
+    while cursor <= range_end:
+        n_days_total += 1
+        day_str = cursor.strftime("%Y%m%d")
+        day_iso = cursor.strftime("%Y-%m-%d")
+        day_norm = cursor.normalize()
+        day_out = out_root / day_str
+        day_out.mkdir(parents=True, exist_ok=True)
+
+        day_t0 = time.time()
+        pred_df_today = pred_df_full[dt_idx == day_norm]
+
+        # 每日 diagnostics + predictions（不写 metrics.json — 简化版）
+        diag_day: Dict[str, Any] = {
+            "schema_version": DIAGNOSTICS_SCHEMA_VERSION,
+            "strategy": args.strategy,
+            "live_end": day_iso,
+            "lookback_days": args.lookback,
+            "started_at": datetime.fromtimestamp(day_t0).isoformat(timespec="seconds"),
+            "model_run_id": model_run_id,
+            "core_version": core_version,
+            "batch_mode": True,
+        }
+
+        if len(pred_df_today) > 0:
+            _atomic_write_parquet(day_out / "predictions.parquet", pred_df_today)
+            diag_day.update({
+                "status": "ok",
+                "exit_code": 0,
+                "duration_ms": int((time.time() - day_t0) * 1000),
+                "rows": int(len(pred_df_today)),
+                "completed_at": datetime.now().isoformat(timespec="seconds"),
+            })
+            n_days_with_data += 1
+        else:
+            diag_day.update({
+                "status": "empty",
+                "exit_code": 0,
+                "duration_ms": int((time.time() - day_t0) * 1000),
+                "rows": 0,
+                "completed_at": datetime.now().isoformat(timespec="seconds"),
+            })
+
+        _atomic_write_json(day_out / "diagnostics.json", diag_day)
+        cursor += pd.Timedelta(days=1)
+
+    total_ms = int((time.time() - t0) * 1000)
+    print(
+        f"[run_inference batch] done {n_days_with_data}/{n_days_total} days have data, "
+        f"total {total_ms}ms (= {total_ms / n_days_total:.0f}ms/day average)"
+    )
+    return 0
+
+
 def main() -> int:
     t0 = time.time()
     args = _build_arg_parser().parse_args()
+
+    # Phase 4 加速回放：批量模式分支（互斥单日模式）
+    if args.live_end_range and args.live_end:
+        print("[run_inference] ERROR: --live-end 与 --live-end-range 互斥", file=sys.stderr)
+        return 2
+    if args.live_end_range:
+        try:
+            return _run_batch_mode(args, t0)
+        except Exception as exc:
+            traceback.print_exc()
+            print(f"[run_inference batch] FAILED: {type(exc).__name__}: {exc}", file=sys.stderr)
+            return 1
+
+    if not args.live_end:
+        print("[run_inference] ERROR: 需要 --live-end 或 --live-end-range 之一", file=sys.stderr)
+        return 2
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
