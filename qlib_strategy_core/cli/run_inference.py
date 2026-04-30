@@ -188,9 +188,10 @@ def main() -> int:
         # 预测(CSI300 ≈ 300 行), 否则下游 selections/topk/metrics 会被历史行
         # 污染. IC 计算仍用完整 pred_df (历史部分的 label 可能可算, 保留机会).
         live_end_day = pd.Timestamp(args.live_end).normalize()
-        pred_df_today = pred_df[
-            pred_df.index.get_level_values("datetime").normalize() == live_end_day
-        ]
+        # qlib 数据 index 的 datetime level 在某些版本/数据源下可能是普通 Index（object/string dtype），
+        # 而非 DatetimeIndex；先 pd.to_datetime 强制转换以兼容（Index.normalize 仅 DatetimeIndex 支持）。
+        dt_idx = pd.to_datetime(pred_df.index.get_level_values("datetime"))
+        pred_df_today = pred_df[dt_idx.normalize() == live_end_day]
 
         _atomic_write_parquet(out_dir / "predictions.parquet", pred_df_today)
 
