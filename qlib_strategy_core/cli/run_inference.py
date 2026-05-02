@@ -173,8 +173,8 @@ def _run_batch_mode(args, t0: float) -> int:
         f"{range_end.date()}]"
     )
 
-    # 一次 predict 出整段
-    pred_df_full, _task = predict_range_from_bundle(
+    # 一次 predict 出整段; dataset 复用算每日 PSI/KS/IC
+    pred_df_full, _task, dataset = predict_range_from_bundle(
         bundle_dir=bundle_dir,
         segment_start=segment_start,
         segment_end=range_end,
@@ -183,6 +183,53 @@ def _run_batch_mode(args, t0: float) -> int:
 
     # datetime level 兼容（与单日模式相同处理）
     dt_idx = pd.to_datetime(pred_df_full.index.get_level_values("datetime"))
+
+    # 加载 baseline (PSI 用) + 整段 features / label (按日切片复用)
+    from qlib_strategy_core.metrics import (
+        compute_ic,
+        compute_rank_ic,
+        compute_psi_by_feature,
+        compute_ks_by_feature,
+        compute_prediction_stats,
+        compute_score_histogram,
+        compute_feature_missing_rate,
+        summarize_psi,
+    )
+
+    baseline_path = Path(args.baseline) if args.baseline else (bundle_dir / "baseline.parquet")
+    baseline_df = None
+    if baseline_path.exists():
+        try:
+            baseline_df = pd.read_parquet(baseline_path)
+        except Exception as exc:
+            print(f"[run_inference batch] baseline 加载失败 {baseline_path}: {exc}")
+
+    # 整段 features (用于按日 PSI/KS/missing); label (用于 IC)
+    features_full = None
+    label_full = None
+    try:
+        features_full = dataset.prepare(["test"], col_set="feature")[0]
+        if isinstance(features_full.columns, pd.MultiIndex):
+            features_full.columns = [c[-1] if isinstance(c, tuple) else c for c in features_full.columns]
+    except Exception as exc:
+        print(f"[run_inference batch] features prepare 失败: {exc}")
+    try:
+        label_prep = dataset.prepare(["test"], col_set="label")[0]
+        label_full = (
+            label_prep.iloc[:, 0]
+            if isinstance(label_prep, pd.DataFrame) and label_prep.shape[1] >= 1
+            else label_prep
+        )
+        if hasattr(label_full, "dropna"):
+            label_full = label_full.dropna()
+    except Exception as exc:
+        print(f"[run_inference batch] label prepare 失败: {exc}")
+
+    feat_dt_idx = (
+        pd.to_datetime(features_full.index.get_level_values("datetime"))
+        if features_full is not None and "datetime" in (features_full.index.names or [])
+        else None
+    )
 
     # 按日切片写每日子目录
     out_root = Path(args.out_dir)
@@ -217,6 +264,55 @@ def _run_batch_mode(args, t0: float) -> int:
 
         if len(pred_df_today) > 0:
             _atomic_write_parquet(day_out / "predictions.parquet", pred_df_today)
+
+            # batch 模式也写完整 metrics.json (与 single-day 模式 metrics 一致)
+            # IC / RankIC / PSI / KS / histogram / pred_stats / feat_missing —
+            # 不再"简化版", 实盘和回放产物等同, 衔接进入实时模式时数据状态完整。
+            import math
+            metrics: Dict[str, Any] = {
+                "schema_version": DIAGNOSTICS_SCHEMA_VERSION,
+                "strategy": args.strategy,
+                "trade_date": day_iso,
+                "model_run_id": model_run_id,
+                "core_version": core_version,
+                "n_predictions": int(len(pred_df_today)),
+            }
+            metrics.update(compute_prediction_stats(pred_df_today))
+            metrics["score_histogram"] = compute_score_histogram(pred_df_today, n_bins=20)
+
+            # IC / RankIC — 用整段 label (forward 11d) 算
+            metrics["ic"] = None
+            metrics["rank_ic"] = None
+            if label_full is not None and len(label_full) > 0:
+                try:
+                    ic = compute_ic(pred_df_today, label_full)
+                    rank_ic = compute_rank_ic(pred_df_today, label_full)
+                    metrics["ic"] = None if (isinstance(ic, float) and math.isnan(ic)) else ic
+                    metrics["rank_ic"] = None if (isinstance(rank_ic, float) and math.isnan(rank_ic)) else rank_ic
+                except Exception as exc:
+                    metrics["ic_error"] = f"{type(exc).__name__}: {exc}"
+
+            # PSI + KS + missing — 切片当日 features 跟 baseline 比
+            if baseline_df is None:
+                metrics["baseline_error"] = f"baseline parquet not found: {baseline_path}"
+            elif features_full is None or feat_dt_idx is None:
+                metrics["baseline_error"] = "features prepare 失败 (见上方 stderr)"
+            else:
+                try:
+                    features_today = features_full[feat_dt_idx == day_norm]
+                    if len(features_today) > 0:
+                        psi_by_feature = compute_psi_by_feature(features_today, baseline_df)
+                        metrics["psi_by_feature"] = psi_by_feature
+                        metrics.update(summarize_psi(psi_by_feature))
+                        metrics["ks_by_feature"] = compute_ks_by_feature(features_today, baseline_df)
+                        metrics["feat_missing"] = compute_feature_missing_rate(features_today)
+                    else:
+                        metrics["baseline_error"] = "当日 features 切片为空"
+                except Exception as exc:
+                    metrics["baseline_error"] = f"{type(exc).__name__}: {exc}"
+
+            _atomic_write_json(day_out / "metrics.json", metrics)
+
             diag_day.update({
                 "status": "ok",
                 "exit_code": 0,

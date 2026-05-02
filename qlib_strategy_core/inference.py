@@ -167,13 +167,11 @@ def _predict_core_range(
     segment_start: pd.Timestamp,
     segment_end: pd.Timestamp,
     handler_overrides: Optional[Dict[str, Any]] = None,
-) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+) -> Tuple[pd.DataFrame, Dict[str, Any], Any]:
     """批量预测核心：覆盖整个 [segment_start, segment_end] 区间一次性 predict。
 
-    与 :func:`_predict_core` 区别在于：
-    - 不依赖 lookback_days；调用方直接给 segment 起止日
-    - 适用于 Phase 4 加速回放：一次 dataset build + 一次 predict 出多日结果，
-      避免逐日 spawn 子进程的 ~80% 启动 + qlib 加载开销
+    返回 (pred_df, task, dataset) — dataset 让 batch loop 复用 prepare 后的
+    features / label 算 PSI / KS / IC, 跟 single-day 模式 metrics 完全一致。
     """
     task = copy.deepcopy(task)
     task["dataset"]["kwargs"]["segments"] = {
@@ -194,7 +192,7 @@ def _predict_core_range(
     pred = model.predict(dataset, segment="test")
     if isinstance(pred, pd.Series):
         pred = pred.to_frame("score")
-    return pred, task
+    return pred, task, dataset
 
 
 def predict_range_from_bundle(
@@ -202,11 +200,9 @@ def predict_range_from_bundle(
     segment_start: pd.Timestamp,
     segment_end: pd.Timestamp,
     handler_overrides: Optional[Dict[str, Any]] = None,
-) -> Tuple[pd.DataFrame, Dict[str, Any]]:
-    """批量推理入口：一次加载 bundle + 一次 predict 整个 [segment_start, segment_end] 区间。
-
-    Phase 4 加速回放用。预期加速 ~10-20x：把"逐日 spawn 子进程"的
-    ~80% 启动 + qlib 数据加载开销均摊到一次调用。
+) -> Tuple[pd.DataFrame, Dict[str, Any], Any]:
+    """批量推理入口: 一次加载 bundle + 一次 predict 整个 [segment_start, segment_end] 区间.
+    返回 (pred, task, dataset) — dataset 让调用方复用算 PSI/KS/IC 等。
     """
     bundle_dir = Path(bundle_dir)
     params_path = bundle_dir / "params.pkl"
