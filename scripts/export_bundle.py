@@ -173,7 +173,13 @@ def _write_bundle(
     baseline_df: Optional[pd.DataFrame],
     experiment_name: str,
 ) -> None:
-    """Write 5 artifacts into target_dir (atomic via .staging rename pattern)."""
+    """Write 6 artifacts into target_dir (atomic via .staging rename pattern).
+
+    Phase 2 新增 filter_config.json (跨端 filter 契约): 训练侧把 task["filter_descriptor"]
+    序列化, 实盘侧 ModelRegistry.register() 读它派生 ``snapshots/filtered/{filter_id}_{date}.parquet``.
+    缺失 filter_descriptor 时仍写 5 件套 (向后兼容老训练脚本); 但实盘侧加载时会 raise
+    并提示用 backfill_filter_config.py 迁移老 bundle.
+    """
     target_dir.parent.mkdir(parents=True, exist_ok=True)
 
     staging = target_dir.with_suffix(".staging")
@@ -189,6 +195,14 @@ def _write_bundle(
     # 2. task.json — human-readable frozen copy
     with open(staging / "task.json", "w", encoding="utf-8") as f:
         json.dump(_serialize_task_for_json(task), f, ensure_ascii=False, indent=2)
+
+    # 2.5. filter_config.json (Phase 2): bundle 自带 filter chain 声明,
+    # 实盘侧 ModelRegistry 启动期校验 + 派生 snapshot 路径. 训练侧通过
+    # task["filter_descriptor"] = filter_descriptor_to_dict(desc) 注入.
+    filter_descriptor = task.get("filter_descriptor")
+    if filter_descriptor:
+        with open(staging / "filter_config.json", "w", encoding="utf-8") as f:
+            json.dump(filter_descriptor, f, ensure_ascii=False, indent=2)
 
     # 3. manifest.json — version + SHA
     handler_cfg = task["dataset"]["kwargs"]["handler"]
