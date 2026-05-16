@@ -17,8 +17,8 @@
     # 指定 run_id
     python scripts/export_bundle.py --experiment rolling_exp --run-id 0068b7d99...
 
-    # 推送到 vnpy 节点 (设置 VNPY_MODEL_ROOT env 变量)
-    set VNPY_MODEL_ROOT=\\vnpy-node\share\models
+    # 推送到 vnpy 节点 (默认 ${VNPY_DATA_ROOT}/models, 也可显式 --vnpy-root)
+    set VNPY_DATA_ROOT=\\\\vnpy-node\\share
     python scripts/export_bundle.py --experiment rolling_exp --push
 
 手动兜底
@@ -269,13 +269,20 @@ def _robocopy(src: Path, dst: Path) -> int:
     return result.returncode
 
 
+def _default_vnpy_model_root() -> Path:
+    legacy = os.getenv("VNPY_MODEL_ROOT")
+    if legacy:
+        return Path(legacy)
+    return Path(os.getenv("VNPY_DATA_ROOT", "D:/vnpy_data")) / "models"
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="训练工件打包 + 可选推送到 vnpy 节点")
     parser.add_argument("--experiment", default=None, help="MLflow experiment name (default: from QSConfig)")
     parser.add_argument("--run-id", default=None, help="specific run_id; default = latest by test-end")
     parser.add_argument("--export-root", default=None, help="bundle staging dir (default: QS_EXPORT_ROOT or ./qs_exports)")
-    parser.add_argument("--push", action="store_true", help="robocopy bundle to VNPY_MODEL_ROOT")
-    parser.add_argument("--vnpy-root", default=None, help="vnpy model root (default: VNPY_MODEL_ROOT env)")
+    parser.add_argument("--push", action="store_true", help="robocopy bundle to vnpy model root")
+    parser.add_argument("--vnpy-root", default=None, help="vnpy model root (default: VNPY_DATA_ROOT/models)")
     parser.add_argument("--baseline-days", type=int, default=60, help="days from train end to sample for baseline")
     args = parser.parse_args()
 
@@ -302,10 +309,7 @@ def main() -> int:
     print(f"[export_bundle] bundle complete: {target_dir}")
 
     if args.push:
-        vnpy_root = args.vnpy_root or os.getenv("VNPY_MODEL_ROOT")
-        if not vnpy_root:
-            print("[export_bundle] --push 需要 --vnpy-root 或 VNPY_MODEL_ROOT 环境变量", file=sys.stderr)
-            return 1
+        vnpy_root = args.vnpy_root or str(_default_vnpy_model_root())
         push_target = Path(vnpy_root) / experiment_name / run_id
         print(f"[export_bundle] pushing → {push_target}")
         rc = _robocopy(target_dir, push_target)

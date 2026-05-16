@@ -24,10 +24,8 @@ _CORE_ROOT = Path(__file__).resolve().parents[1]
 if str(_CORE_ROOT) not in sys.path:
     sys.path.insert(0, str(_CORE_ROOT))
 
-os.environ.setdefault(
-    "QLIB_PROVIDER_URI",
-    r"F:/Quant/code/qlib_strategy_dev/factor_factory/qlib_data_bin",
-)
+DEFAULT_PROVIDER_URI = str(Path(os.getenv("VNPY_DATA_ROOT", "D:/vnpy_data")) / "qlib_data_bin")
+os.environ.setdefault("QLIB_PROVIDER_URI", DEFAULT_PROVIDER_URI)
 
 from qlib_strategy_core.pipeline import RollingEnv, TaskBuilder
 from qlib_strategy_core.inference import predict_from_bundle
@@ -37,7 +35,7 @@ import pandas as pd
 
 def main() -> None:
     RollingEnv.setup_env()
-    RollingEnv.init_qlib(provider_uri=r"F:/Quant/code/qlib_strategy_dev/factor_factory/qlib_data_bin")
+    RollingEnv.init_qlib(provider_uri=os.environ["QLIB_PROVIDER_URI"])
 
     pred_df, task = predict_from_bundle(
         bundle_dir=r"F:/Quant/code/qlib_strategy_dev/qs_exports/rolling_exp/ab2711178313491f9900b5695b47fa98",

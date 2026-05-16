@@ -11,9 +11,9 @@ qlib bin 末尾 = T, label = forward_N return 需要 T+1..T+N 日 close, bin 没
 ## 调用
 
     python -m qlib_strategy_core.cli.run_ic_backfill \
-        --output-root  D:/ml_output/smoke_full_pipeline \
+        --output-root  ${VNPY_DATA_ROOT}/ml_output/smoke_full_pipeline \
         --strategy     phase27_test \
-        --provider-uri D:/vnpy_data/qlib_data_bin \
+        --provider-uri ${VNPY_DATA_ROOT}/qlib_data_bin \
         --scan-days    30 \
         --forward-window 2
 
