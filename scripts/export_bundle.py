@@ -273,7 +273,10 @@ def _default_vnpy_model_root() -> Path:
     legacy = os.getenv("VNPY_MODEL_ROOT")
     if legacy:
         return Path(legacy)
-    return Path(os.getenv("VNPY_DATA_ROOT", "D:/vnpy_data")) / "models"
+    data_root = os.getenv("VNPY_DATA_ROOT", "").strip()
+    if not data_root:
+        raise RuntimeError("VNPY_DATA_ROOT 未设置，无法解析默认 vnpy model root")
+    return Path(data_root) / "models"
 
 
 def main() -> int:

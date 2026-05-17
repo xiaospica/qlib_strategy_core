@@ -29,7 +29,10 @@ _CORE_ROOT = Path(__file__).resolve().parents[1]
 if str(_CORE_ROOT) not in sys.path:
     sys.path.insert(0, str(_CORE_ROOT))
 
-DEFAULT_PROVIDER_URI = str(Path(os.getenv("VNPY_DATA_ROOT", "D:/vnpy_data")) / "qlib_data_bin")
+_VNPY_DATA_ROOT = os.getenv("VNPY_DATA_ROOT", "").strip()
+if not _VNPY_DATA_ROOT:
+    raise RuntimeError("VNPY_DATA_ROOT 未设置，无法解析默认 QLIB_PROVIDER_URI")
+DEFAULT_PROVIDER_URI = str(Path(_VNPY_DATA_ROOT) / "qlib_data_bin")
 os.environ.setdefault("QLIB_PROVIDER_URI", DEFAULT_PROVIDER_URI)
 
 from qlib_strategy_core.pipeline import RollingEnv, TaskBuilder
